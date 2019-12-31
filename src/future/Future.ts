@@ -4,8 +4,9 @@ enum States {
   REJECTED = "REJECTED"
 }
 
-type ResolveFunction<T> = (value: T) => T | PromiseLike | void;
+type ResolveFunction<T> = (value: T, error?: Error) => T | FutureLike | void;
 type RejectFunction = (error) => void;
+type FinallyFunction = () => void;
 
 type CallbackFunction<T> = (
   resolve: ResolveFunction<T>,
@@ -14,41 +15,52 @@ type CallbackFunction<T> = (
 
 type Pair<T, U> = [T, U];
 
-type PromiseLike = { then: <T>(value: T) => void };
+type FutureLike = { then: <T>(value: T) => void };
 
 export default class Future<T> {
   private state: States = States.PENDING;
+  private value: T;
+  private error: Error;
 
-  private onResolve: Pair<Future<T>, ResolveFunction<T>>;
-  private onReject: Pair<Future<T>, RejectFunction>;
+  private onResolveQueue: Pair<Future<T>, ResolveFunction<T>>[] = [];
+  private onRejectQueue: Pair<Future<T>, RejectFunction>[] = [];
+  private finallyQueue: Pair<Future<T>, FinallyFunction>[] = [];
 
   constructor(callback: CallbackFunction<T>) {
-    process.nextTick(() => {
+    setTimeout(() => {
       try {
         callback(
-          (value: T): void => this.resolve(value),
-          (error): void => this.reject(error)
+          (value: T) => this.resolve(value),
+          error => this.reject(error)
         );
       } catch (error) {
         this.reject(error);
       }
-    });
+    }, 0);
   }
 
-  private isPromiseLike = (object): boolean =>
-    object.hasOwnProperty("then") && typeof object.then === "function";
+  private isFutureLike = (object): boolean =>
+    object &&
+    object.hasOwnProperty("then") &&
+    typeof object.then === "function";
 
   private resolve(value: T): void {
     if (this.state === States.PENDING) {
       this.state = States.FULFILLED;
+      this.value = value;
 
-      const [future, callback] = this.onResolve;
-      const result: T | PromiseLike | void = callback(value);
+      for (const [future, callback] of this.onResolveQueue) {
+        const result: T | FutureLike | void = callback(value);
+        if (this.isFutureLike(result)) {
+          (result as FutureLike).then(value => future.resolve(value));
+        } else {
+          future.resolve(result as T);
+        }
+      }
 
-      if (this.isPromiseLike(result)) {
-        (result as PromiseLike).then(value => future.resolve(value));
-      } else {
-        future.resolve(result as T);
+      for (const [future, callback] of this.finallyQueue) {
+        callback();
+        future.resolve(value);
       }
     }
   }
@@ -56,29 +68,60 @@ export default class Future<T> {
   private reject(error): void {
     if (this.state === States.PENDING) {
       this.state = States.REJECTED;
+      this.error = error;
 
-      if (this.onResolve) {
-        const [future] = this.onResolve;
+      for (const [future, callback] of this.onRejectQueue) {
+        callback(error);
         future.reject(error);
       }
 
-      if (this.onReject) {
-        const [future, callback] = this.onReject;
-        callback(error);
-        future.reject(error);
+      for (const [future, callback] of this.finallyQueue) {
+        callback();
+        future.reject(this.error);
       }
     }
   }
 
-  public then(callback: ResolveFunction<T>) {
+  public then(onResolved?: ResolveFunction<T>, onReject?: RejectFunction) {
     const future = new Future<T>((resolve, reject) => {});
-    this.onResolve = [future, callback];
+
+    if (this.state === States.PENDING) {
+      if (onResolved) {
+        this.onResolveQueue.push([future, onResolved]);
+      }
+      if (onReject) {
+        this.onRejectQueue.push([future, onReject]);
+      }
+    } else if (this.state === States.REJECTED && onResolved) {
+      onResolved(this.value);
+    } else if (this.state === States.FULFILLED && onReject) {
+      onReject(this.error);
+    }
+
     return future;
   }
 
-  public catch(callback: RejectFunction) {
+  public catch(onReject: RejectFunction) {
     const future = new Future<T>((resolve, reject) => {});
-    this.onReject = [future, callback];
+
+    if (this.state === States.REJECTED) {
+      onReject(this.error);
+    } else {
+      this.onRejectQueue.push([future, onReject]);
+    }
+
+    return future;
+  }
+
+  public finally(onFinally: FinallyFunction) {
+    const future = new Future<T>((resolve, reject) => {});
+
+    if (this.state !== States.PENDING) {
+      onFinally();
+    } else {
+      this.finallyQueue.push([future, onFinally]);
+    }
+
     return future;
   }
 }
